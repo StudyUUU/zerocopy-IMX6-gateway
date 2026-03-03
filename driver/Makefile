@@ -45,6 +45,7 @@ modules:
 clean:
 	$(MAKE) -C $(KERN_DIR) M=$(PWD) clean
 	rm -rf modules.order Module.symvers
+	rm -f $(C_TEST_BINS) $(CPP_TEST_BINS)
 
 # ----------------------------------------------------------------
 # 5. 安装和部署目标
@@ -133,8 +134,3 @@ all: $(C_TEST_BINS) $(CPP_TEST_BINS)
 # 编译 C++ 的 _test 程序
 %_test: %_test.cpp
 	$(CXX) $< -o $@
-
-clean:
-	rm -f $(C_TEST_BINS) $(CPP_TEST_BINS)
-
-.PHONY: all clean
