@@ -1,33 +1,38 @@
 #!/bin/bash
-#
-# Build All Components
-#
 
-set -e
+# 定义颜色输出
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+NC='\033[0m'
 
-echo "=== Building Zero-Copy IMX6 Gateway ==="
-echo ""
+# 获取项目根目录
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
-# Build driver
-echo "[1/2] Building kernel driver..."
-cd driver
+echo -e "${GREEN}[1/2] 正在编译内核驱动...${NC}"
+cd "$PROJECT_ROOT/driver"
 make clean
 make
-cd ..
-echo "Driver build complete!"
-echo ""
 
-# Build userspace
-echo "[2/2] Building userspace application..."
-cd userspace
+echo -e "${GREEN}[2/2] 正在编译用户态应用...${NC}"
+cd "$PROJECT_ROOT/userspace"
 make clean
 make
-cd ..
-echo "Userspace build complete!"
-echo ""
 
-echo "=== Build Complete ==="
-echo ""
-echo "Next steps:"
-echo "  1. Load driver:  sudo ./scripts/load_driver.sh"
-echo "  2. Start server: sudo ./scripts/start_server.sh [port]"
+echo -e "${GREEN}编译完成！${NC}"
+
+# 复制用户态应用
+if [ -f "$PROJECT_ROOT/userspace/zerocopy_gateway" ]; then
+    sudo cp "$PROJECT_ROOT/userspace/zerocopy_gateway" ~/linux/rootfs/lib/modules/4.1.15/zerocopy/
+    echo -e "${GREEN}已将用户态应用复制到目标文件系统！${NC}"
+else
+    echo -e "${RED}错误: 用户态应用编译失败${NC}"
+fi
+
+# 复制内核模块
+if [ -f "$PROJECT_ROOT/driver/spi_sdma.ko" ]; then
+    sudo cp "$PROJECT_ROOT/driver/spi_sdma.ko" ~/linux/rootfs/lib/modules/4.1.15/zerocopy/
+    echo -e "${GREEN}已将内核模块复制到目标文件系统！${NC}"
+else
+    echo -e "${RED}错误: 内核模块编译失败${NC}"
+fi

@@ -1,59 +1,34 @@
 /*
- * Common Protocol Definitions
- * 
- * Shared between kernel and userspace
+ * protocol.h - 内核驱动与用户态应用共享的协议头文件
+ *
+ * 作用：定义 Netlink 通信号码、数据结构、内存映射大小等。
+ * 这样无论是在 driver 还是在 userspace，修改一处即可全局生效。
  */
 
-#ifndef __PROTOCOL_H__
-#define __PROTOCOL_H__
+#ifndef _ICM20608_PROTOCOL_H_
+#define _ICM20608_PROTOCOL_H_
 
-#include <stdint.h>
+/* 1. Netlink 协议号 (必须一致) 
+ * 31 是内核保留给用户的最大自定义协议号
+ */
+#define NETLINK_ICM_NOTIFY 31
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+/* 2. 内存映射相关 */
+#define ICM_DMA_BUF_SIZE 4096  /* 映射的内存大小 (1个PAGE_SIZE) */
+#define ICM_DEV_PATH "/dev/alientek_icm20608" /* 设备节点路径 */
 
-/* Netlink protocol number */
-#define NETLINK_SDMA_PROTO 31
-
-/* Device path */
-#define DEVICE_PATH "/dev/spi_sdma"
-
-/* DMA buffer configuration */
-#define DMA_BUFFER_SIZE (4096 * 4)  /* 16KB */
-
-/* Netlink message types */
-enum netlink_msg_type {
-    NLMSG_DATA_READY = 1,
-    NLMSG_ERROR_EVENT = 2,
-    NLMSG_STATUS = 3,
+/* 3. 传感器数据结构 (与内核态严格对齐) */
+struct icm_sensor_data {
+    signed int gyro_x;
+    signed int gyro_y;
+    signed int gyro_z;
+    signed int accel_x;
+    signed int accel_y;
+    signed int accel_z;
+    signed int temp;
 };
 
-/* Netlink message structure */
-struct netlink_sdma_msg {
-    uint32_t msg_type;
-    uint32_t seq_num;
-    uint32_t data_size;
-    uint64_t timestamp;
-} __attribute__((packed));
+/* 4. 定义应用层发给内核的命令字 (用于注册 PID) */
+#define ICM_CMD_REGISTER_PID "REG_PID"
 
-/* IOCTL commands */
-#define IOCTL_START_DMA    0x01
-#define IOCTL_GET_BUF_INFO 0x02
-
-/* TCP protocol - data packet header */
-struct tcp_data_header {
-    uint32_t magic;          /* Magic number: 0x53444D41 "SDMA" */
-    uint32_t seq_num;        /* Sequence number */
-    uint32_t data_size;      /* Payload size */
-    uint64_t timestamp;      /* Timestamp */
-    uint32_t checksum;       /* Simple checksum */
-} __attribute__((packed));
-
-#define TCP_MAGIC 0x53444D41
-
-#ifdef __cplusplus
-}
-#endif
-
-#endif /* __PROTOCOL_H__ */
+#endif /* _ICM20608_PROTOCOL_H_ */

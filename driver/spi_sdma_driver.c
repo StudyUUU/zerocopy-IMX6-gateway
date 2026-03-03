@@ -1,10 +1,11 @@
 /*
- * icm20608_cdev.c - ICM20608 SPI 驱动 (现代 Sysfs 规范版 + 工作队列自动采集)
+ * icm20608_cdev.c - ICM20608 SPI 驱动 (现代 Sysfs 规范版 + 工作队列自动采集 + Netlink 异步通知)
  *
  * 核心改进：
  * 1. [mmap 零拷贝] 预分配 DMA 一致性内存并映射至用户空间。
  * 2. [后台自动采集] 引入 delayed_work，每隔 20ms 自动在后台读取 SPI 数据并写入 DMA 内存。
  * 3. 规避了 Timer 无法休眠的问题，实现了安全的并发访问。
+ * 4. [手术 3: Netlink 异步通知] 引入 Netlink，采集完成后主动通知应用层，彻底消除轮询。
  */
 
 #include <linux/bitmap.h>
@@ -33,8 +34,12 @@
 #include <linux/dma-mapping.h>
 #include <linux/mm.h>
 #include <linux/workqueue.h> /* === [手术 2 新增] 工作队列头文件 === */
+#include <net/sock.h>        /* === [手术 3 新增] Netlink 核心头文件 === */
+#include <linux/netlink.h>   /* === [手术 3 新增] Netlink 协议头文件 === */
+#include <linux/skbuff.h>    /* === [手术 3 新增] Socket Buffer 头文件 === */
 
 #include "icm20608_reg.h"
+#include "../common/protocol.h" /* === [手术 3 新增] 引入共享协议头文件 === */
 
 #define DRIVER_NAME "alientek_icm20608_driver"
 #define CLASS_NAME "alientek_icm20608_class"
@@ -48,16 +53,13 @@ static struct class* icm_class;
 static DECLARE_BITMAP(icm_minor_bitmap, MAX_DEVICES);
 static DEFINE_MUTEX(icm_minor_lock);
 
+/* === [手术 3 新增] Netlink 全局资源 === */
+static struct sock *icm_nl_sock = NULL;
+static int app_pid = -1; /* 记录应用层进程 ID */
+static DEFINE_MUTEX(nl_mutex);
+
 /* 传感器原始数据结构 */
-struct original_data {
-    signed int gyro_x_adc;
-    signed int gyro_y_adc;
-    signed int gyro_z_adc;
-    signed int accel_x_adc;
-    signed int accel_y_adc;
-    signed int accel_z_adc;
-    signed int temp_adc;
-};
+/* 注意：这里我们使用 protocol.h 中定义的 struct icm_sensor_data，不再重复定义 */
 
 /* 设备私有上下文 */
 struct icm_device_data {
@@ -66,7 +68,7 @@ struct icm_device_data {
     int minor;
     struct mutex lock; 
     struct spi_device* spi;
-    struct original_data data;
+    struct icm_sensor_data data; /* 使用共享协议中的结构体 */
 
     /* DMA 一致性内存三件套 */
     size_t dma_buf_size;      
@@ -76,6 +78,69 @@ struct icm_device_data {
     /* === [手术 2 新增] 延迟工作队列，用于后台循环采集 === */
     struct delayed_work dwork;
 };
+
+/* ========================================================================== */
+/* [手术 3 新增] Netlink 消息发送函数                                           */
+/* ========================================================================== */
+static void send_netlink_notify(int data_ready_flag)
+{
+    struct sk_buff *skb;
+    struct nlmsghdr *nlh;
+    int msg_size = sizeof(int);
+    int res;
+    int target_pid;
+
+    /* 1. 安全获取目标 PID */
+    mutex_lock(&nl_mutex);
+    target_pid = app_pid;
+    mutex_unlock(&nl_mutex);
+
+    /* 如果用户态没有注册 PID，或者 Netlink Socket 未初始化，则跳过发送 */
+    if (target_pid == -1 || !icm_nl_sock) {
+        return;
+    }
+
+    /* 2. 分配 Socket Buffer (GFP_ATOMIC 允许在软中断或工作队列中使用) */
+    skb = nlmsg_new(msg_size, GFP_ATOMIC);
+    if (!skb) {
+        return;
+    }
+
+    /* 3. 构造 Netlink 消息头 */
+    nlh = nlmsg_put(skb, 0, 0, NLMSG_DONE, msg_size, 0);
+    if (!nlh) {
+        kfree_skb(skb);
+        return;
+    }
+
+    /* 4. 填充有效负载数据 (发送一个标志位或计数值) */
+    memcpy(nlmsg_data(nlh), &data_ready_flag, msg_size);
+
+    /* 5. 通过单播 (Unicast) 发送给指定的 PID */
+    res = nlmsg_unicast(icm_nl_sock, skb, target_pid);
+    if (res < 0) {
+        /* 发送失败处理，比如应用已退出 */
+    }
+}
+
+/* ========================================================================== */
+/* [手术 3 新增] 接收用户态 Netlink 消息的回调函数                              */
+/* 用于用户态程序启动时，主动向内核发送自己的 PID 进行“注册”                     */
+/* ========================================================================== */
+static void icm_nl_recv_msg(struct sk_buff *skb)
+{
+    struct nlmsghdr *nlh;
+
+    /* 解析接收到的 Netlink 消息头 */
+    nlh = (struct nlmsghdr *)skb->data;
+
+    /* 记录发送方的 PID */
+    mutex_lock(&nl_mutex);
+    app_pid = nlh->nlmsg_pid;
+    mutex_unlock(&nl_mutex);
+
+    pr_info("ICM20608: Netlink registered App PID: %d\n", app_pid);
+}
 
 /* === 底层 SPI 读写辅助函数 (保持不变) === */
 static int icm20608_read_regs(struct spi_device* spi, u8 reg, void* buf, int len) {
@@ -160,24 +225,17 @@ static void icm20608_readdata(struct icm_device_data* dev_data) {
     unsigned char data[14] = { 0 };
     icm20608_read_regs(dev_data->spi, ACCEL_XOUT_H, data, 14);
 
-    dev_data->data.accel_x_adc = (signed short)((data[0] << 8) | data[1]);
-    dev_data->data.accel_y_adc = (signed short)((data[2] << 8) | data[3]);
-    dev_data->data.accel_z_adc = (signed short)((data[4] << 8) | data[5]);
-    dev_data->data.temp_adc = (signed short)((data[6] << 8) | data[7]);
-    dev_data->data.gyro_x_adc = (signed short)((data[8] << 8) | data[9]);
-    dev_data->data.gyro_y_adc = (signed short)((data[10] << 8) | data[11]);
-    dev_data->data.gyro_z_adc = (signed short)((data[12] << 8) | data[13]);
+    dev_data->data.accel_x = (signed short)((data[0] << 8) | data[1]);
+    dev_data->data.accel_y = (signed short)((data[2] << 8) | data[3]);
+    dev_data->data.accel_z = (signed short)((data[4] << 8) | data[5]);
+    dev_data->data.temp = (signed short)((data[6] << 8) | data[7]);
+    dev_data->data.gyro_x = (signed short)((data[8] << 8) | data[9]);
+    dev_data->data.gyro_y = (signed short)((data[10] << 8) | data[11]);
+    dev_data->data.gyro_z = (signed short)((data[12] << 8) | data[13]);
 
     /* 将数据同步拷贝到 DMA 映射区 (供 mmap 读取) */
     if (dev_data->dma_buf_virt) {
-        signed int *mapped_mem = (signed int *)dev_data->dma_buf_virt;
-        mapped_mem[0] = dev_data->data.gyro_x_adc;
-        mapped_mem[1] = dev_data->data.gyro_y_adc;
-        mapped_mem[2] = dev_data->data.gyro_z_adc;
-        mapped_mem[3] = dev_data->data.accel_x_adc;
-        mapped_mem[4] = dev_data->data.accel_y_adc;
-        mapped_mem[5] = dev_data->data.accel_z_adc;
-        mapped_mem[6] = dev_data->data.temp_adc;
+        memcpy(dev_data->dma_buf_virt, &dev_data->data, sizeof(struct icm_sensor_data));
     }
 }
 
@@ -188,13 +246,18 @@ static void icm_work_func(struct work_struct *work)
 {
     /* 通过 container_of 找到私有数据 (针对 delayed_work 的标准用法) */
     struct icm_device_data *dev_data = container_of(work, struct icm_device_data, dwork.work);
+    static int sync_counter = 0;
 
     /* 1. 安全地读取数据并填充内存 */
     mutex_lock(&dev_data->lock);
     icm20608_readdata(dev_data);
     mutex_unlock(&dev_data->lock);
 
-    /* 2. 重新调度自己，20ms 后再次执行 (实现 50Hz 自动刷新) */
+    /* === [手术 3 新增] 2. 触发 Netlink 异步通知 === */
+    sync_counter++;
+    send_netlink_notify(sync_counter);
+
+    /* 3. 重新调度自己，20ms 后再次执行 (实现 50Hz 自动刷新) */
     schedule_delayed_work(&dev_data->dwork, msecs_to_jiffies(20));
 }
 
@@ -205,17 +268,17 @@ static void icm_work_func(struct work_struct *work)
 static ssize_t accel_data_show(struct device *dev, struct device_attribute *attr, char *buf) {
     struct icm_device_data *priv = dev_get_drvdata(dev);
     /* 因为后台有 workqueue 在不断更新数据，这里直接打印最新内存即可，无需调用 readdata */
-    return sprintf(buf, "X:%d Y:%d Z:%d\n", priv->data.accel_x_adc, priv->data.accel_y_adc, priv->data.accel_z_adc);
+    return sprintf(buf, "X:%d Y:%d Z:%d\n", priv->data.accel_x, priv->data.accel_y, priv->data.accel_z);
 }
 
 static ssize_t gyro_data_show(struct device *dev, struct device_attribute *attr, char *buf) {
     struct icm_device_data *priv = dev_get_drvdata(dev);
-    return sprintf(buf, "X:%d Y:%d Z:%d\n", priv->data.gyro_x_adc, priv->data.gyro_y_adc, priv->data.gyro_z_adc);
+    return sprintf(buf, "X:%d Y:%d Z:%d\n", priv->data.gyro_x, priv->data.gyro_y, priv->data.gyro_z);
 }
 
 static ssize_t temp_data_show(struct device *dev, struct device_attribute *attr, char *buf) {
     struct icm_device_data *priv = dev_get_drvdata(dev);
-    return sprintf(buf, "Temp ADC:%d\n", priv->data.temp_adc);
+    return sprintf(buf, "Temp ADC:%d\n", priv->data.temp);
 }
 
 static DEVICE_ATTR_RO(accel_data);
@@ -259,26 +322,17 @@ static int icm20608_open(struct inode* inode, struct file* filp) {
 }
 
 static ssize_t icm20608_read(struct file* filp, char __user* buf, size_t len, loff_t* off) {
-    signed int data[7];
     struct icm_device_data* dev_data = filp->private_data;
 
-    if (len < sizeof(data)) return -EINVAL;
+    if (len < sizeof(struct icm_sensor_data)) return -EINVAL;
     if (mutex_lock_interruptible(&dev_data->lock)) return -ERESTARTSYS;
 
     /* 手动读取一次 (为了兼容老的 read 接口) */
     icm20608_readdata(dev_data);
-    data[0] = dev_data->data.gyro_x_adc;
-    data[1] = dev_data->data.gyro_y_adc;
-    data[2] = dev_data->data.gyro_z_adc;
-    data[3] = dev_data->data.accel_x_adc;
-    data[4] = dev_data->data.accel_y_adc;
-    data[5] = dev_data->data.accel_z_adc;
-    data[6] = dev_data->data.temp_adc;
-
     mutex_unlock(&dev_data->lock);
 
-    if (copy_to_user(buf, data, sizeof(data))) return -EFAULT;
-    return sizeof(data); 
+    if (copy_to_user(buf, &dev_data->data, sizeof(struct icm_sensor_data))) return -EFAULT;
+    return sizeof(struct icm_sensor_data); 
 }
 
 static int icm20608_mmap(struct file *filp, struct vm_area_struct *vma)
@@ -349,7 +403,7 @@ static int icm20608_probe(struct spi_device* spi) {
     }
 
     /* 分配 DMA 一致性内存 */
-    dev_data->dma_buf_size = PAGE_SIZE; 
+    dev_data->dma_buf_size = ICM_DMA_BUF_SIZE; 
     dev_data->dma_buf_virt = dma_alloc_coherent(dev, dev_data->dma_buf_size,
                                                 &dev_data->dma_buf_phys, GFP_KERNEL);
     if (!dev_data->dma_buf_virt) {
@@ -445,7 +499,13 @@ static struct spi_driver icm20608_driver = {
 };
 
 static int __init icm20608_init(void) {
-    int ret = alloc_chrdev_region(&icm_dev_number, 0, MAX_DEVICES, DEVICE_NAME);
+    int ret;
+    /* === [手术 3 新增] Netlink 配置结构体 === */
+    struct netlink_kernel_cfg cfg = {
+        .input = icm_nl_recv_msg, /* 绑定接收用户态消息的回调函数 */
+    };
+
+    ret = alloc_chrdev_region(&icm_dev_number, 0, MAX_DEVICES, DEVICE_NAME);
     if (ret < 0) return ret;
     
     icm_class = class_create(THIS_MODULE, CLASS_NAME);
@@ -453,9 +513,19 @@ static int __init icm20608_init(void) {
         unregister_chrdev_region(icm_dev_number, MAX_DEVICES);
         return PTR_ERR(icm_class);
     }
+
+    /* === [手术 3 新增] 创建 Netlink 套接字 === */
+    icm_nl_sock = netlink_kernel_create(&init_net, NETLINK_ICM_NOTIFY, &cfg);
+    if (!icm_nl_sock) {
+        pr_err("icm20608: Failed to create netlink socket\n");
+        class_destroy(icm_class);
+        unregister_chrdev_region(icm_dev_number, MAX_DEVICES);
+        return -ENOMEM;
+    }
     
     ret = spi_register_driver(&icm20608_driver);
     if (ret) {
+        netlink_kernel_release(icm_nl_sock);
         class_destroy(icm_class);
         unregister_chrdev_region(icm_dev_number, MAX_DEVICES);
     }
@@ -464,6 +534,13 @@ static int __init icm20608_init(void) {
 
 static void __exit icm20608_exit(void) {
     spi_unregister_driver(&icm20608_driver);
+
+    /* === [手术 3 新增] 释放 Netlink 套接字 === */
+    if (icm_nl_sock) {
+        netlink_kernel_release(icm_nl_sock);
+        icm_nl_sock = NULL;
+    }
+
     class_destroy(icm_class);
     unregister_chrdev_region(icm_dev_number, MAX_DEVICES);
 }

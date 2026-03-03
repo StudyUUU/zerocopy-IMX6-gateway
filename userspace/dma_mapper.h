@@ -1,43 +1,27 @@
 /*
- * DMA Buffer Mapper - mmap DMA buffer from kernel
+ * dma_mapper.h - DMA 一致性内存映射封装 (纯 C 版)
  */
 
-#ifndef __DMA_MAPPER_H__
-#define __DMA_MAPPER_H__
+#ifndef DMA_MAPPER_H
+#define DMA_MAPPER_H
 
-#include <cstddef>
-#include <cstdint>
+#include "../common/protocol.h"
+#include <stdbool.h>
 
-class DmaMapper {
-public:
-    DmaMapper();
-    ~DmaMapper();
-    
-    // Open device and map DMA buffer
-    bool init(const char *device_path);
-    
-    // Cleanup
-    void close();
-    
-    // Get mapped buffer pointer
-    void* getBuffer() const { return mapped_addr_; }
-    
-    // Get buffer size
-    size_t getBufferSize() const { return buffer_size_; }
-    
-    // Get device fd
-    int getFd() const { return dev_fd_; }
-    
-    // Trigger DMA transfer via ioctl
-    bool startDmaTransfer();
-    
-    // Read data from buffer at offset
-    bool readData(void *dest, size_t offset, size_t size);
-    
-private:
-    int dev_fd_;
-    void *mapped_addr_;
-    size_t buffer_size_;
+/* 相当于 C++ 中的 Class 成员变量 */
+struct dma_mapper_t {
+    int fd;
+    void* mapped_mem;
+    struct icm_sensor_data* sensor_data_ptr;
 };
 
-#endif /* __DMA_MAPPER_H__ */
+/* 初始化映射 */
+bool dma_mapper_init(struct dma_mapper_t *mapper, const char *dev_path);
+
+/* 获取最新数据 */
+bool dma_mapper_get_latest_data(struct dma_mapper_t *mapper, struct icm_sensor_data *out_data);
+
+/* 清理资源 */
+void dma_mapper_cleanup(struct dma_mapper_t *mapper);
+
+#endif /* DMA_MAPPER_H */

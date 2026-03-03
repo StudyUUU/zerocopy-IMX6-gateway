@@ -1,24 +1,27 @@
 # Userspace Application Makefile
 
-CXX := g++
-CXXFLAGS := -std=c++11 -Wall -O2 -I../common
+# Cross-compilation setup for IMX6
+CROSS_COMPILE ?= arm-linux-gnueabihf-
+
+CC := $(CROSS_COMPILE)gcc
+CFLAGS := -std=gnu99 -Wall -O2 -I../common
 LDFLAGS := -lpthread
 
 TARGET := zerocopy_gateway
 
-SRCS := main.cpp netlink_client.cpp dma_mapper.cpp epoll_server.cpp
-OBJS := $(SRCS:.cpp=.o)
+SRCS := main.c netlink_client.c dma_mapper.c epoll_server.c
+OBJS := $(SRCS:.c=.o)
 
 .PHONY: all clean install
 
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
-	$(CXX) $(OBJS) -o $(TARGET) $(LDFLAGS)
+	$(CC) $(OBJS) -o $(TARGET) $(LDFLAGS)
 	@echo "Build complete: $(TARGET)"
 
-%.o: %.cpp
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
 	rm -f $(OBJS) $(TARGET)
