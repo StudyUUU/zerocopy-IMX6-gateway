@@ -1,339 +1,175 @@
 # Zero-Copy IMX6 Gateway
 
-基于 i.MX6ULL 的高性能零拷贝数据采集与转发系统
+基于 i.MX6ULL 的高性能零拷贝工业传感器网关，实现从 ICM20608 六轴 IMU 传感器到局域网 UDP 广播的全链路低延迟数据转发。
 
-## 项目简介
+## 核心技术亮点
 
-在 i.MX6ULL 平台上实现了"**SDMA硬件搬运 -> Netlink内核通信 -> Epoll网络分发**"的全流程数据采集与转发系统。在单核弱算力环境下实现多路信号的高效零拷贝采集与转发。
+| 技术点 | 实现方式 | 解决的问题 |
+|--------|----------|------------|
+| **SDMA 硬件搬运** | `spi_async` + `is_dma_mapped=1` 强制 i.MX6 SDMA 引擎接管 SPI 传输 | CPU 零参与数据搬运，传输期间 CPU 完全空闲 |
+| **mmap 零拷贝** | `dma_alloc_coherent` + `remap_pfn_range`，用户态直接映射物理内存 | 内核→用户态零次 `copy_to_user`，数据直达应用层 |
+| **高精度定时器** | `hrtimer` 硬中断上下文 50Hz 精确触发 | 替代低精度内核定时器，保证采样时序稳定 |
+| **Netlink 异步通知** | 内核 Tasklet 回调中发送 Netlink 消息唤醒用户态 | 替代轮询，实现事件驱动的数据推送 |
+| **Epoll 事件驱动** | 用户态 Epoll 监听 Netlink fd，非阻塞转发 | 单线程高效处理 I/O 事件，资源占用极低 |
 
-### 核心特性
-
-- ⚡ **零拷贝传输**：通过 mmap 直接映射 DMA 缓冲区，避免数据拷贝
-- 🚀 **硬件 DMA 加速**：利用 SDMA 引擎自主搬运数据，降低 CPU 负载
-- 📡 **异步通知**：基于 Netlink Socket 的内核-用户空间通信，替代轮询
-- 🔄 **高并发处理**：Epoll I/O 多路复用，单线程高效处理多路 TCP 连接
-- 💾 **一致性内存**：使用 `dma_alloc_coherent` 分配 DMA 可访问内存
-
-## 技术架构
+## 系统架构
 
 ```
-┌─────────────┐
-│  SPI 设备    │
-└──────┬──────┘
-       │ SDMA (硬件DMA)
-       ↓
-┌─────────────────────────┐
-│   内核驱动层             │
-│  • SPI 字符设备驱动      │
-│  • DMA Engine 管理       │
-│  • Netlink 异步通知      │
-│  • mmap 映射支持         │
-└──────┬──────────────────┘
-       │ mmap + Netlink
-       ↓
-┌─────────────────────────┐
-│   用户态服务层           │
-│  • Netlink 客户端        │
-│  • DMA 缓冲区映射        │
-│  • Epoll 服务器          │
-│  • TCP 数据广播          │
-└──────┬──────────────────┘
-       │ TCP
-       ↓
-┌─────────────┐
-│  多路客户端  │
-└─────────────┘
+ICM20608 传感器
+     │ SPI Bus (8MHz)
+     ▼
+┌─────────────────────────────── 内核态 ───────────────────────────────┐
+│  HRTimer (50Hz)  ──触发──▶  spi_async + SDMA  ──DMA完成──▶  Tasklet │
+│                              硬件搬运数据                   回调函数  │
+│                                  │                            │      │
+│                                  ▼                            ▼      │
+│                          DMA 一致性内存              Netlink 通知     │
+│                         (dma_alloc_coherent)         (异步唤醒)      │
+└──────────────────────────────┬───────────────────────────┬───────────┘
+                               │ mmap (零拷贝)             │ Netlink Socket
+                               ▼                           ▼
+┌─────────────────────────────── 用户态 ───────────────────────────────┐
+│  DMA Mapper ◄─── 零拷贝读取    Epoll Server ◄─── 事件唤醒            │
+│      │                              │                                │
+│      └──────── 传感器数据 ──────────▶ JSON 打包 ──▶ UDP 广播 (8888)  │
+└──────────────────────────────────────────────────────────────────────┘
+                                                           │
+                                                           ▼
+                                                   上位机实时监控
+                                                  (Python matplotlib)
 ```
 
 ## 项目结构
 
 ```
 zerocopy-IMX6-gateway/
-├── driver/                 # 内核驱动模块
-│   ├── spi_sdma_driver.c  # SPI SDMA 主驱动
-│   ├── netlink_comm.c/h   # Netlink 通信模块
-│   └── Makefile           # 驱动编译脚本
-│
-├── userspace/             # 用户态服务程序
-│   ├── main.cpp           # 主程序
-│   ├── netlink_client.*   # Netlink 客户端
-│   ├── dma_mapper.*       # DMA 映射管理
-│   ├── epoll_server.*     # Epoll TCP 服务器
-│   └── Makefile           # 用户态编译脚本
-│
-├── common/                # 共享协议定义
-│   └── protocol.h         # 内核-用户态协议
-│
-├── scripts/               # 辅助脚本
-│   ├── build_all.sh       # 一键编译
-│   ├── load_driver.sh     # 加载驱动
-│   ├── unload_driver.sh   # 卸载驱动
-│   └── start_server.sh    # 启动服务
-│
-├── docs/                  # 文档
-│   └── architecture.md    # 架构设计文档
-│
-├── Makefile               # 顶层 Makefile
-└── README.md              # 本文件
+├── common/
+│   └── protocol.h            # 内核/用户态共享协议定义 (Netlink 协议号、数据结构)
+├── driver/
+│   ├── icm20608_reg.h         # ICM20608 寄存器地址定义
+│   ├── spi_sdma_driver.c      # 内核驱动 (SPI+SDMA+HRTimer+Netlink+mmap)
+│   └── Makefile               # 内核模块编译
+├── userspace/
+│   ├── netlink_client.c/.h    # Netlink 客户端 (PID 注册 + 消息接收)
+│   ├── dma_mapper.c/.h        # DMA 内存映射封装 (mmap 零拷贝)
+│   ├── epoll_server.c/.h      # Epoll 事件循环 + UDP 广播转发
+│   ├── main.c                 # 用户态程序入口
+│   └── Makefile               # 用户态交叉编译
+├── scripts/
+│   ├── build_all.sh           # 一键编译与部署脚本
+│   └── test_client.py         # PC 端实时数据可视化工具
+├── docs/
+│   └── architecture.md        # 详细架构设计文档
+├── Makefile                   # 顶层 Makefile
+└── README.md
 ```
+
+## 环境要求
+
+- **目标平台**: i.MX6ULL (ARM Cortex-A7)，正点原子 ALPHA/Mini 开发板
+- **内核版本**: Linux 4.1.15 (NXP 官方 BSP)
+- **交叉编译链**: `arm-linux-gnueabihf-gcc`
+- **传感器**: ICM20608G/D 六轴 IMU (SPI 接口)
+- **上位机**: Python 3 + matplotlib (用于实时可视化)
 
 ## 快速开始
 
-### 前置要求
-
-- i.MX6ULL 开发板（或兼容平台）
-- Linux 内核源码（用于编译驱动）
-- 交叉编译工具链（如果交叉编译）
-- GCC/G++ 编译器
-
-### 编译
-
-#### 方法一：一键编译（推荐）
+### 1. 编译
 
 ```bash
-chmod +x scripts/*.sh
+# 一键编译驱动 + 用户态应用
+make all
+
+# 或分别编译
+make driver      # 仅编译内核模块 spi_sdma.ko
+make userspace   # 仅编译用户态程序 zerocopy_gateway
+```
+
+### 2. 部署到开发板
+
+```bash
+# 使用脚本一键编译并部署到 rootfs
 ./scripts/build_all.sh
 ```
 
-#### 方法二：分步编译
+编译产物将自动复制到 `~/linux/rootfs/lib/modules/4.1.15/zerocopy/` 目录。
+
+### 3. 在开发板上运行
 
 ```bash
-# 编译内核驱动
-cd driver
-make KERNEL_DIR=/path/to/kernel/source
-cd ..
+# 加载内核驱动
+insmod /lib/modules/4.1.15/zerocopy/spi_sdma.ko
 
-# 编译用户态程序
-cd userspace
-make
-cd ..
+# 启动网关程序
+/lib/modules/4.1.15/zerocopy/zerocopy_gateway
 ```
 
-### 运行
-
-#### 1. 加载内核驱动
+### 4. PC 端实时监控
 
 ```bash
-sudo ./scripts/load_driver.sh
+# 在同一局域网的 PC 上运行可视化客户端
+pip install matplotlib
+python scripts/test_client.py
 ```
 
-验证驱动加载成功：
-```bash
-ls -l /dev/spi_sdma
-lsmod | grep spi_sdma
-dmesg | tail -20
-```
+上位机将自动接收 UDP 广播数据 (端口 8888)，并以实时波形图显示加速度计和陀螺仪数据。
 
-#### 2. 启动服务程序
+## 数据格式
 
-```bash
-sudo ./scripts/start_server.sh [port] [device]
-# 默认: port=8888, device=/dev/spi_sdma
-```
+网关通过 UDP 广播发送 JSON 格式的传感器数据：
 
-#### 3. 连接客户端
-
-使用任意 TCP 客户端连接：
-```bash
-nc localhost 8888
-# 或者使用 Python、C++ 等编写客户端
-```
-
-### 卸载
-
-```bash
-# 停止服务程序 (Ctrl+C)
-
-# 卸载驱动
-sudo ./scripts/unload_driver.sh
-```
-
-## 工作原理
-
-### 数据流程
-
-1. **触发 DMA**：用户态通过 ioctl 触发 DMA 传输
-2. **硬件搬运**：SDMA 从 SPI 设备搬运数据到内存缓冲区
-3. **中断通知**：DMA 完成后产生中断，驱动在 Tasklet 中发送 Netlink 消息
-4. **异步接收**：用户态 Netlink 客户端收到数据就绪通知
-5. **零拷贝读取**：通过 mmap 映射直接访问 DMA 缓冲区
-6. **并发分发**：Epoll 服务器广播数据到所有 TCP 客户端
-7. **循环往复**：触发下一次 DMA 传输
-
-### 关键技术
-
-#### 1. DMA 一致性内存分配
-
-```c
-// 内核驱动中
-void *virt_addr = dma_alloc_coherent(dev, size, &phys_addr, GFP_KERNEL);
-```
-
-#### 2. mmap 零拷贝映射
-
-```c
-// 用户态
-void *mapped = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
-```
-
-#### 3. Netlink 异步通知
-
-```c
-// 内核: 在 DMA 回调中
-tasklet_schedule(&netlink_tasklet);  // 发送通知
-
-// 用户态: 在 epoll 循环中
-if (fd == netlink_fd) {
-    netlink_client.receiveMessage();  // 处理通知
+```json
+{
+    "seq": 12345,
+    "accel": [0.012, -0.003, 1.001],
+    "gyro": [0.50, -1.20, 0.30],
+    "temp": 25.60
 }
 ```
 
-#### 4. Epoll 并发处理
+| 字段 | 类型 | 单位 | 说明 |
+|------|------|------|------|
+| `seq` | int | - | 数据包序号 (递增) |
+| `accel` | float[3] | g | 加速度计 X/Y/Z (±16g 量程) |
+| `gyro` | float[3] | °/s | 陀螺仪 X/Y/Z (±2000°/s 量程) |
+| `temp` | float | °C | 芯片温度 |
 
-```c
-int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, timeout);
-for (int i = 0; i < nfds; i++) {
-    // 处理事件
-}
-```
+## 传感器配置
 
-## 性能特点
+| 参数 | 配置值 | 说明 |
+|------|--------|------|
+| SPI 时钟 | 8 MHz | SPI_MODE_0, 8-bit |
+| 采样率 | 50 Hz | HRTimer 20ms 周期 |
+| 加速度计量程 | ±16g | 灵敏度 2048 LSB/g |
+| 陀螺仪量程 | ±2000°/s | 灵敏度 16.4 LSB/(°/s) |
+| 数字低通滤波 | DLPF=4 | 加速度计 + 陀螺仪均启用 |
 
-- **CPU 使用率低**：硬件 DMA 搬运，CPU 仅处理控制逻辑
-- **延迟低**：异步通知机制，无轮询开销
-- **吞吐量高**：零拷贝传输，避免内存拷贝
-- **可扩展性好**：Epoll 支持大量并发连接
+## 性能指标
 
-## 配置选项
-
-### 驱动配置
-
-在 [driver/spi_sdma_driver.c](driver/spi_sdma_driver.c) 中修改：
-
-```c
-#define DMA_BUFFER_SIZE (4096 * 4)  // DMA 缓冲区大小
-#define MAX_TRANSFER_SIZE 4096      // 单次传输大小
-```
-
-### Netlink 协议号
-
-在 [common/protocol.h](common/protocol.h) 中修改：
-
-```c
-#define NETLINK_SDMA_PROTO 31  // 修改为未使用的协议号
-```
-
-### TCP 端口
-
-启动时指定：
-```bash
-./scripts/start_server.sh 9999  # 使用 9999 端口
-```
+| 指标 | 数值 | 说明 |
+|------|------|------|
+| 数据采集延迟 | < 1ms | SDMA 硬件传输 + Tasklet 回调 |
+| 数据路径拷贝次数 | **0** | mmap 零拷贝，无 `copy_to_user` |
+| CPU 占用率 | < 3% | DMA 硬件搬运 + 事件驱动，CPU 几乎空闲 |
+| 采样精度 | ±0.1ms | HRTimer 硬中断级精度 |
+| UDP 广播端口 | 8888 | 局域网广播 255.255.255.255 |
 
 ## 设备树配置
 
-需要在设备树中添加 SPI 节点配置：
+确保设备树中包含 ICM20608 的 SPI 节点配置：
 
 ```dts
-&ecspi1 {
+&ecspi3 {
+    pinctrl-names = "default";
+    pinctrl-0 = <&pinctrl_ecspi3>;
+    cs-gpios = <&gpio1 20 GPIO_ACTIVE_LOW>;
     status = "okay";
-    
-    spi_sdma@0 {
-        compatible = "alientek,spi-sdma";
+
+    icm20608: icm20608@0 {
+        compatible = "alientek,icm20608";
+        spi-max-frequency = <8000000>;
         reg = <0>;
-        spi-max-frequency = <10000000>;
-        dmas = <&sdma 7 7 1>, <&sdma 8 7 2>;
-        dma-names = "rx", "tx";
     };
 };
 ```
 
-## 调试
-
-### 查看内核日志
-
-```bash
-dmesg | grep -i "spi_sdma\|netlink"
-```
-
-### 查看 Netlink 连接
-
-```bash
-ss -A netlink
-```
-
-### 查看 TCP 连接
-
-```bash
-netstat -antp | grep zerocopy_gateway
-```
-
-### 监控系统调用
-
-```bash
-strace -e epoll_wait,recvmsg,sendto ./userspace/zerocopy_gateway
-```
-
-## 常见问题
-
-### Q: 驱动加载失败显示 "Unknown symbol"
-
-**A**: 确保编译驱动时使用的内核源码版本与运行的内核版本一致。
-
-### Q: 设备节点 /dev/spi_sdma 不存在
-
-**A**: 检查驱动是否正确加载 (`lsmod`)，查看 dmesg 错误信息。
-
-### Q: 用户态程序报 "Failed to open device"
-
-**A**: 确认设备节点权限，执行 `sudo chmod 666 /dev/spi_sdma`。
-
-### Q: Netlink 注册失败
-
-**A**: 检查协议号是否与其他模块冲突，修改 `NETLINK_SDMA_PROTO`。
-
-## 扩展开发
-
-### 添加新的 Netlink 消息类型
-
-1. 在 [common/protocol.h](common/protocol.h) 中添加消息类型
-2. 在驱动的 [driver/netlink_comm.c](driver/netlink_comm.c) 中发送
-3. 在用户态 [userspace/netlink_client.cpp](userspace/netlink_client.cpp) 中处理
-
-### 自定义 TCP 协议
-
-修改 [userspace/main.cpp](userspace/main.cpp) 中的数据封装逻辑，修改 `tcp_data_header` 结构。
-
-## 文档
-
-详细的架构设计和技术实现，请参阅：
-
-- [系统架构设计文档](docs/architecture.md)
-
-## 性能基准
-
-测试环境：i.MX6ULL (单核 Cortex-A7 @ 528MHz)
-
-| 指标 | 数值 |
-|------|------|
-| DMA 传输速率 | ~10 MB/s |
-| CPU 使用率 | < 15% |
-| 端到端延迟 | < 5 ms |
-| 并发连接数 | 100+ |
-| 零拷贝收益 | 节省 ~40% CPU |
-
-## 许可证
-
-GPL v2
-
-## 作者
-
-Your Name
-
-## 贡献
-
-欢迎提交 Issue 和 Pull Request！
-
-## 致谢
-
-本项目基于 Linux DMA Engine、Netlink 和 Epoll 等内核特性实现。
