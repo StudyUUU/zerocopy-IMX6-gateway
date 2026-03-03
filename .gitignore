@@ -12,6 +12,8 @@ modules.order
 
 # Userspace binary
 userspace/zerocopy_gateway
+driver/test_spi
+test_spi
 
 # Editor files
 *.swp
