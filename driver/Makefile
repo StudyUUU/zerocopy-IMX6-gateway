@@ -107,3 +107,34 @@ help:
 	@echo "================================================================"
 
 .PHONY: all modules clean install copy help
+
+# ----------------------------------------------------------------
+# 7. C++ _test 程序编译
+# ----------------------------------------------------------------
+
+# 交叉编译器设置
+CC := arm-linux-gnueabihf-gcc
+CXX := arm-linux-gnueabihf-g++
+
+# 获取当前目录下所有的 _test 源文件
+C_TEST_SRCS := $(wildcard *_test.c)
+CPP_TEST_SRCS := $(wildcard *_test.cpp)
+
+# 定义生成的目标二进制文件名
+C_TEST_BINS := $(C_TEST_SRCS:.c=)
+CPP_TEST_BINS := $(CPP_TEST_SRCS:.cpp=)
+
+all: $(C_TEST_BINS) $(CPP_TEST_BINS)
+
+# 编译 C 的 _test 程序
+%_test: %_test.c
+	$(CC) $< -o $@
+
+# 编译 C++ 的 _test 程序
+%_test: %_test.cpp
+	$(CXX) $< -o $@
+
+clean:
+	rm -f $(C_TEST_BINS) $(CPP_TEST_BINS)
+
+.PHONY: all clean

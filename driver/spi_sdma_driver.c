@@ -1,10 +1,10 @@
 /*
- * icm20608_cdev.c - ICM20608 SPI 驱动 (现代 Sysfs 规范版)
+ * icm20608_cdev.c - ICM20608 SPI 驱动 (现代 Sysfs 规范版 + 工作队列自动采集)
  *
  * 核心改进：
- * 1. 引入 Attribute Groups 实现设备与 Sysfs 属性的原子化创建。
- * 2. 增加 accel_data, gyro_data, temp_data 三个 Sysfs 只读节点，方便命令行直接调试。
- * 3. 严格遵循 OOP 思想，上下文数据通过 dev_get_drvdata 传递。
+ * 1. [mmap 零拷贝] 预分配 DMA 一致性内存并映射至用户空间。
+ * 2. [后台自动采集] 引入 delayed_work，每隔 20ms 自动在后台读取 SPI 数据并写入 DMA 内存。
+ * 3. 规避了 Timer 无法休眠的问题，实现了安全的并发访问。
  */
 
 #include <linux/bitmap.h>
@@ -28,9 +28,11 @@
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/spi/spi.h>
-#include <linux/timer.h>
 #include <linux/uaccess.h>
 #include <linux/wait.h>
+#include <linux/dma-mapping.h>
+#include <linux/mm.h>
+#include <linux/workqueue.h> /* === [手术 2 新增] 工作队列头文件 === */
 
 #include "icm20608_reg.h"
 
@@ -65,6 +67,14 @@ struct icm_device_data {
     struct mutex lock; 
     struct spi_device* spi;
     struct original_data data;
+
+    /* DMA 一致性内存三件套 */
+    size_t dma_buf_size;      
+    void *dma_buf_virt;       
+    dma_addr_t dma_buf_phys;  
+
+    /* === [手术 2 新增] 延迟工作队列，用于后台循环采集 === */
+    struct delayed_work dwork;
 };
 
 /* === 底层 SPI 读写辅助函数 (保持不变) === */
@@ -157,48 +167,61 @@ static void icm20608_readdata(struct icm_device_data* dev_data) {
     dev_data->data.gyro_x_adc = (signed short)((data[8] << 8) | data[9]);
     dev_data->data.gyro_y_adc = (signed short)((data[10] << 8) | data[11]);
     dev_data->data.gyro_z_adc = (signed short)((data[12] << 8) | data[13]);
+
+    /* 将数据同步拷贝到 DMA 映射区 (供 mmap 读取) */
+    if (dev_data->dma_buf_virt) {
+        signed int *mapped_mem = (signed int *)dev_data->dma_buf_virt;
+        mapped_mem[0] = dev_data->data.gyro_x_adc;
+        mapped_mem[1] = dev_data->data.gyro_y_adc;
+        mapped_mem[2] = dev_data->data.gyro_z_adc;
+        mapped_mem[3] = dev_data->data.accel_x_adc;
+        mapped_mem[4] = dev_data->data.accel_y_adc;
+        mapped_mem[5] = dev_data->data.accel_z_adc;
+        mapped_mem[6] = dev_data->data.temp_adc;
+    }
 }
 
 /* ========================================================================== */
-/* [新增] Sysfs 属性组实现 (用于命令行极速调试)                             */
+/* [手术 2 新增] 工作队列回调函数 (相当于可以睡眠的定时器)                    */
+/* ========================================================================== */
+static void icm_work_func(struct work_struct *work)
+{
+    /* 通过 container_of 找到私有数据 (针对 delayed_work 的标准用法) */
+    struct icm_device_data *dev_data = container_of(work, struct icm_device_data, dwork.work);
+
+    /* 1. 安全地读取数据并填充内存 */
+    mutex_lock(&dev_data->lock);
+    icm20608_readdata(dev_data);
+    mutex_unlock(&dev_data->lock);
+
+    /* 2. 重新调度自己，20ms 后再次执行 (实现 50Hz 自动刷新) */
+    schedule_delayed_work(&dev_data->dwork, msecs_to_jiffies(20));
+}
+
+/* ========================================================================== */
+/* Sysfs 属性组实现                                                           */
 /* ========================================================================== */
 
 static ssize_t accel_data_show(struct device *dev, struct device_attribute *attr, char *buf) {
     struct icm_device_data *priv = dev_get_drvdata(dev);
-    
-    mutex_lock(&priv->lock);
-    icm20608_readdata(priv);
-    mutex_unlock(&priv->lock);
-    
+    /* 因为后台有 workqueue 在不断更新数据，这里直接打印最新内存即可，无需调用 readdata */
     return sprintf(buf, "X:%d Y:%d Z:%d\n", priv->data.accel_x_adc, priv->data.accel_y_adc, priv->data.accel_z_adc);
 }
 
 static ssize_t gyro_data_show(struct device *dev, struct device_attribute *attr, char *buf) {
     struct icm_device_data *priv = dev_get_drvdata(dev);
-    
-    mutex_lock(&priv->lock);
-    icm20608_readdata(priv);
-    mutex_unlock(&priv->lock);
-    
     return sprintf(buf, "X:%d Y:%d Z:%d\n", priv->data.gyro_x_adc, priv->data.gyro_y_adc, priv->data.gyro_z_adc);
 }
 
 static ssize_t temp_data_show(struct device *dev, struct device_attribute *attr, char *buf) {
     struct icm_device_data *priv = dev_get_drvdata(dev);
-    
-    mutex_lock(&priv->lock);
-    icm20608_readdata(priv);
-    mutex_unlock(&priv->lock);
-    
     return sprintf(buf, "Temp ADC:%d\n", priv->data.temp_adc);
 }
 
-/* 定义只读属性宏 */
 static DEVICE_ATTR_RO(accel_data);
 static DEVICE_ATTR_RO(gyro_data);
 static DEVICE_ATTR_RO(temp_data);
 
-/* 步骤 1：放入属性数组 */
 static struct attribute *icm_sysfs_attrs[] = {
     &dev_attr_accel_data.attr,
     &dev_attr_gyro_data.attr,
@@ -206,12 +229,10 @@ static struct attribute *icm_sysfs_attrs[] = {
     NULL,
 };
 
-/* 步骤 2：封装为属性组 */
 static const struct attribute_group icm_attr_group = {
     .attrs = icm_sysfs_attrs,
 };
 
-/* 步骤 3：构造供创建函数使用的指针数组 */
 static const struct attribute_group *icm_attr_groups[] = {
     &icm_attr_group,
     NULL,
@@ -244,6 +265,7 @@ static ssize_t icm20608_read(struct file* filp, char __user* buf, size_t len, lo
     if (len < sizeof(data)) return -EINVAL;
     if (mutex_lock_interruptible(&dev_data->lock)) return -ERESTARTSYS;
 
+    /* 手动读取一次 (为了兼容老的 read 接口) */
     icm20608_readdata(dev_data);
     data[0] = dev_data->data.gyro_x_adc;
     data[1] = dev_data->data.gyro_y_adc;
@@ -259,6 +281,24 @@ static ssize_t icm20608_read(struct file* filp, char __user* buf, size_t len, lo
     return sizeof(data); 
 }
 
+static int icm20608_mmap(struct file *filp, struct vm_area_struct *vma)
+{
+    struct icm_device_data *dev_data = filp->private_data;
+    size_t size = vma->vm_end - vma->vm_start;
+
+    if (size > dev_data->dma_buf_size)
+        return -EINVAL;
+
+    vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+
+    if (remap_pfn_range(vma, vma->vm_start,
+                        dev_data->dma_buf_phys >> PAGE_SHIFT,
+                        size, vma->vm_page_prot)) {
+        return -EAGAIN;
+    }
+    return 0;
+}
+
 static int icm20608_release(struct inode* inode, struct file* filp) {
     filp->private_data = NULL;
     return 0;
@@ -268,10 +308,11 @@ static const struct file_operations icm_fops = {
     .owner = THIS_MODULE,
     .open = icm20608_open,
     .read = icm20608_read,
+    .mmap = icm20608_mmap, 
     .release = icm20608_release,
 };
 
-/* === 5. 【总线特定】SPI 驱动实现 === */
+/* === SPI 驱动实现 === */
 
 static int icm20608_probe(struct spi_device* spi) {
     struct device* dev = &spi->dev;
@@ -297,6 +338,27 @@ static int icm20608_probe(struct spi_device* spi) {
     mutex_init(&dev_data->lock);
     dev_data->spi = spi;
 
+    /* 显式设置 DMA Mask */
+    if (!dev->dma_mask) {
+        dev->dma_mask = &dev->coherent_dma_mask;
+    }
+    ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
+    if (ret) {
+        dev_err(dev, "Failed to set DMA mask\n");
+        goto fail_clear_bit;
+    }
+
+    /* 分配 DMA 一致性内存 */
+    dev_data->dma_buf_size = PAGE_SIZE; 
+    dev_data->dma_buf_virt = dma_alloc_coherent(dev, dev_data->dma_buf_size,
+                                                &dev_data->dma_buf_phys, GFP_KERNEL);
+    if (!dev_data->dma_buf_virt) {
+        dev_err(dev, "Failed to allocate DMA buffer\n");
+        ret = -ENOMEM;
+        goto fail_clear_bit;
+    }
+    memset(dev_data->dma_buf_virt, 0, dev_data->dma_buf_size);
+
     spi->mode = SPI_MODE_0;
     spi->bits_per_word = 8;
     spi->max_speed_hz = 8000000;
@@ -311,9 +373,6 @@ static int icm20608_probe(struct spi_device* spi) {
         of_property_read_string(spi->dev.of_node, "label", &device_name_str);
     }
 
-    /* * [核心改进] 使用 device_create_with_groups 实现原子性创建
-     * 一次性创建设备节点 (/dev/xxx) 和关联的 Sysfs 属性 (/sys/class/...)
-     */
     if (device_name_str) {
         dev_data->dev_node = device_create_with_groups(
             icm_class, dev, devt, dev_data, icm_attr_groups, "%s", device_name_str);
@@ -328,6 +387,11 @@ static int icm20608_probe(struct spi_device* spi) {
     }
 
     spi_set_drvdata(spi, dev_data);
+
+    /* === [手术 2 新增] 初始化并启动工作队列自动采集 === */
+    INIT_DELAYED_WORK(&dev_data->dwork, icm_work_func);
+    schedule_delayed_work(&dev_data->dwork, msecs_to_jiffies(20)); // 延迟 20ms 后第一次执行
+
     dev_info(dev, "probed successfully (minor %d)\n", minor);
     return 0;
 
@@ -345,9 +409,16 @@ static int icm20608_remove(struct spi_device* spi) {
     int minor = dev_data->minor;
     dev_t devt = MKDEV(MAJOR(icm_dev_number), minor);
 
-    /* device_destroy 会自动清理绑定的 Sysfs 属性，无需手动 remove */
+    /* === [手术 2 新增] 必须先停止工作队列，防止其在内存释放后继续运行导致内核崩溃 === */
+    cancel_delayed_work_sync(&dev_data->dwork);
+
     device_destroy(icm_class, devt);
     cdev_del(&dev_data->cdev);
+
+    if (dev_data->dma_buf_virt) {
+        dma_free_coherent(&spi->dev, dev_data->dma_buf_size,
+                          dev_data->dma_buf_virt, dev_data->dma_buf_phys);
+    }
 
     mutex_lock(&icm_minor_lock);
     clear_bit(minor, icm_minor_bitmap);

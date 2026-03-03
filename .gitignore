@@ -28,3 +28,6 @@ core.*
 
 # Logs
 *.log
+
+# test
+*_test
